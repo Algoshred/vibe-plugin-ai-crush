@@ -6,7 +6,11 @@
  */
 
 import { Elysia } from "elysia";
-import type { HostServices, VibePlugin, ProfileContext } from "@vibecontrols/plugin-sdk";
+import type {
+  HostServices,
+  VibePlugin,
+  ProfileContext,
+} from "@vibecontrols/plugin-sdk";
 import {
   BoundLogger,
   ProviderRegistry,
@@ -166,7 +170,11 @@ const CLI_BIN = resolveCliBin();
 const DISPLAY = "Crush";
 const API_PREFIX = `/api/ai-${PROVIDER_NAME}`;
 const SUPPORTED_MODES: ProviderMode[] = ["cli"];
-const CLI_INSTALL_KIND = "manual" as const;
+// Charmbracelet Crush ships a global npm package; install it bun/npm-first so
+// it works on the Alpine + Bun agent image (no node/npm) as well as locally.
+// https://www.npmjs.com/package/@charmland/crush
+const CLI_INSTALL_KIND = "npm" as const;
+const CLI_NPM_PACKAGE = "@charmland/crush";
 
 interface ManagedSession {
   id: string;
@@ -435,6 +443,45 @@ function getCliVersion(): string | null {
   return null;
 }
 
+/**
+ * Install a global npm CLI, runtime-resiliently. The agent always ships Bun
+ * (it IS a Bun process) but NOT npm/node — the production agent image is Alpine
+ * + Bun only — so a hard-coded `npm install -g` silently fails there. We try
+ * each available global installer in turn and report the last error.
+ */
+function installGlobalNpmCli(pkgSpec: string): {
+  ok: boolean;
+  message: string;
+} {
+  const candidates: string[][] = [
+    ["bun", "install", "-g", pkgSpec],
+    ["npm", "install", "-g", pkgSpec],
+  ];
+  let lastError = "";
+  for (const cmd of candidates) {
+    const exe = cmd[0]!;
+    if (!Bun.which(exe, { PATH: process.env.PATH })) continue;
+    try {
+      const proc = Bun.spawnSync(cmd, {
+        timeout: 180_000,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (proc.exitCode === 0) return { ok: true, message: cmd.join(" ") };
+      lastError =
+        proc.stderr.toString().trim() || `${exe} exited ${proc.exitCode}`;
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+    }
+  }
+  return {
+    ok: false,
+    message:
+      lastError ||
+      `No global installer (bun/npm) found. Run manually: bun install -g ${pkgSpec}`,
+  };
+}
+
 function createPrereqsRoutes() {
   return new Elysia({ prefix: "/prereqs" })
     .get("/status", () => {
@@ -461,16 +508,20 @@ function createPrereqsRoutes() {
           pendingSudo: [],
           errors: [],
         };
+
+      const result = installGlobalNpmCli(CLI_NPM_PACKAGE);
+      if (result.ok)
+        return {
+          ok: true,
+          installed: [CLI_COMMAND],
+          pendingSudo: [],
+          errors: [],
+        };
       return {
         ok: false,
         installed: [],
         pendingSudo: [],
-        errors: [
-          {
-            name: CLI_COMMAND,
-            message: `Install ${DISPLAY} CLI from its vendor instructions and retry.`,
-          },
-        ],
+        errors: [{ name: CLI_COMMAND, message: result.message }],
       };
     });
 }
